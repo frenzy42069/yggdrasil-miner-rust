@@ -1,26 +1,25 @@
 use std::fs;
-use std::sync::atomic::AtomicU8;
-use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::AtomicU8;
+use std::sync::mpsc;
 use std::thread;
 use std::time;
 
 use chrono::SecondsFormat;
 use chrono::Utc;
-use ocl::builders::DeviceSpecifier;
-use ocl::builders::ProgramBuilder;
-use ocl::flags::MemFlags;
 use ocl::Buffer;
 use ocl::Platform;
 use ocl::ProQue;
 use ocl::Result;
-use rand::RngCore;
+use ocl::builders::DeviceSpecifier;
+use ocl::builders::ProgramBuilder;
+use ocl::flags::MemFlags;
+use rand::Rng;
 use rayon::prelude::*;
-use regex::Regex;
 
-use crate::handler::handle_keypair;
 use crate::Args;
+use crate::handler::handle_keypair;
 
 #[derive(Clone, Copy)]
 struct GpuOptions {
@@ -63,7 +62,8 @@ impl Gpu {
             .platform(platforms[opts.platform_idx])
             .device(DeviceSpecifier::Indices(vec![opts.device_idx]))
             .dims(32 * opts.threads)
-            .build()?;
+            .build()
+            .unwrap();
 
         let device = pro_que.device();
         eprintln!("Initializing GPU {} {}", device.vendor()?, device.name()?);
@@ -117,12 +117,7 @@ impl Gpu {
     }
 }
 
-pub fn run_opencl(
-    args: &Args,
-    regexes: &[String],
-    compiled_regexes: Vec<Regex>,
-    csv_file: &Option<Mutex<fs::File>>,
-) {
+pub fn run_opencl(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
     let pubkeys = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
     let next_seeds = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
     let current_seeds = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
@@ -144,23 +139,23 @@ pub fn run_opencl(
     let _gpu_thread = {
         let seeds = next_seeds.clone();
         let pubkeys = pubkeys.clone();
-        thread::spawn(move || loop {
-            keys_read_tx.send(()).unwrap();
-            start_write_compute_rx.recv().unwrap();
+        thread::spawn(move || {
+            loop {
+                keys_read_tx.send(()).unwrap();
+                start_write_compute_rx.recv().unwrap();
 
-            gpu.write_seeds(&seeds.lock().unwrap()).unwrap();
-            seeds_wrote_tx.send(()).unwrap();
+                gpu.write_seeds(&seeds.lock().unwrap()).unwrap();
+                seeds_wrote_tx.send(()).unwrap();
 
-            gpu.compute().unwrap();
+                gpu.compute().unwrap();
 
-            start_keys_read_rx.recv().unwrap();
-            gpu.read_keys(&mut pubkeys.lock().unwrap()).unwrap();
+                start_keys_read_rx.recv().unwrap();
+                gpu.read_keys(&mut pubkeys.lock().unwrap()).unwrap();
+            }
         })
     };
 
-    let max_leading_zeros: Vec<AtomicU8> = (0..(compiled_regexes.len()))
-        .map(|_| AtomicU8::new(0))
-        .collect();
+    let max_leading_zeros: AtomicU8 = AtomicU8::new(0);
     let mut first_run = true;
 
     gen_random_seeds(&mut next_seeds.lock().unwrap());
@@ -176,9 +171,8 @@ pub fn run_opencl(
             handle_keypairs(
                 &current_seeds.lock().unwrap(),
                 &pubkeys.lock().unwrap(),
-                regexes,
-                &compiled_regexes,
                 &max_leading_zeros,
+                args.highest,
                 csv_file,
             );
         }
@@ -212,28 +206,18 @@ pub fn run_opencl(
 fn handle_keypairs(
     seeds: &[u8],
     pubkeys: &[u8],
-    regex_sources: &[String],
-    regexes: &[Regex],
-    max_leading_zeros: &[AtomicU8],
+    max_leading_zeros: &AtomicU8,
+    highest: bool,
     csv_file: &Option<Mutex<fs::File>>,
 ) {
     pubkeys
         .par_chunks_exact(32)
         .zip(seeds.par_chunks_exact(32))
-        .for_each(|(pk, seed)| {
-            handle_keypair(
-                seed,
-                pk,
-                regex_sources,
-                regexes,
-                max_leading_zeros,
-                csv_file,
-            )
-        });
+        .for_each(|(pk, seed)| handle_keypair(seed, pk, max_leading_zeros, highest, csv_file));
 }
 
 fn gen_random_seeds(seeds: &mut [u8]) {
     seeds.par_chunks_exact_mut(128 * 1024).for_each(|seed| {
-        rand::thread_rng().fill_bytes(seed);
+        rand::rng().fill_bytes(seed);
     })
 }

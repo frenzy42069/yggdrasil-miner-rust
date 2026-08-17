@@ -1,70 +1,64 @@
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use hex::ToHex;
-use regex::Regex;
 
 use std::fs;
 use std::io::Write;
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub fn handle_keypair(
     seed: &[u8],
     pk: &[u8],
-    regex_sources: &[String],
-    regexes: &[Regex],
-    max_leading_zeros: &[AtomicU8],
+    max_leading_zeros: &AtomicU8,
+    highest: bool,
     csv_file: &Option<Mutex<fs::File>>,
 ) {
     let leading_zeros = leading_zeros_of_pubkey(pk);
-
     let mut str_addr = None;
 
-    for ((re, mlz), re_src) in regexes
-        .iter()
-        .zip(max_leading_zeros.iter())
-        .zip(regex_sources.iter())
-    {
-        if mlz.load(Ordering::Relaxed) <= leading_zeros {
-            let str_addr = str_addr.get_or_insert_with(|| address_for_pubkey(pk).to_string());
+    if !highest || max_leading_zeros.load(Ordering::Relaxed) < leading_zeros {
+        let addr = address_for_pubkey(pk);
 
-            if re.is_match(str_addr)
-                && mlz.fetch_max(leading_zeros, Ordering::SeqCst) <= leading_zeros
+        if let segs = addr.segments()
+            && segs.contains(&0x1337)
+            && segs.contains(&0x0)
+            && segs.contains(&0x0ace)
+            && (!highest
+                || max_leading_zeros.fetch_max(leading_zeros, Ordering::SeqCst) < leading_zeros)
+        {
+            let str_addr = str_addr.get_or_insert_with(|| addr.to_string());
+
             {
-                {
-                    let mut fixed_seed = [0; 32];
-                    fixed_seed.copy_from_slice(seed);
-                    let signing_key = SigningKey::from_bytes(&fixed_seed);
-                    let verifying_key_bytes = signing_key.verifying_key().to_bytes();
-                    assert_eq!(verifying_key_bytes, pk);
-                }
+                let mut fixed_seed = [0; 32];
+                fixed_seed.copy_from_slice(seed);
+                let signing_key = SigningKey::from_bytes(&fixed_seed);
+                let verifying_key_bytes = signing_key.verifying_key().to_bytes();
+                assert_eq!(verifying_key_bytes, pk);
+            }
 
-                let mut sk = [0u8; 64];
-                sk[..32].copy_from_slice(seed);
-                sk[32..].copy_from_slice(pk);
-                let privkey_str: String = sk.encode_hex();
+            let mut sk = [0u8; 64];
+            sk[..32].copy_from_slice(seed);
+            sk[32..].copy_from_slice(pk);
+            let privkey_str: String = sk.encode_hex();
 
-                {
-                    let mut lock = std::io::stdout().lock();
-                    writeln!(lock, "=======================================").unwrap();
-                    writeln!(lock, "PrivateKey: {privkey_str}",).unwrap();
-                    writeln!(lock, "Address: {}", str_addr).unwrap();
-                    if !re_src.is_empty() {
-                        writeln!(lock, "Regex: {}", re_src).unwrap();
-                    }
-                    writeln!(lock, "Height: {}", leading_zeros).unwrap();
-                    writeln!(lock, "=======================================").unwrap();
-                }
+            {
+                let mut lock = std::io::stdout().lock();
+                writeln!(lock, "=======================================").unwrap();
+                writeln!(lock, "PrivateKey: {privkey_str}",).unwrap();
+                writeln!(lock, "Address: {}", str_addr).unwrap();
+                writeln!(lock, "Height: {}", leading_zeros).unwrap();
+                writeln!(lock, "=======================================").unwrap();
+            }
 
-                if let Some(csv_file) = csv_file {
-                    let mut csv_file = csv_file.lock().unwrap();
-                    writeln!(
-                        csv_file,
-                        "{},{str_addr},{leading_zeros},{re_src},{privkey_str}",
-                        Utc::now().timestamp()
-                    )
-                    .unwrap();
-                }
+            if let Some(csv_file) = csv_file {
+                let mut csv_file = csv_file.lock().unwrap();
+                writeln!(
+                    csv_file,
+                    "{},{str_addr},{leading_zeros},{privkey_str}", // TODO: CSV stuff
+                    Utc::now().timestamp()
+                )
+                .unwrap();
             }
         }
     }

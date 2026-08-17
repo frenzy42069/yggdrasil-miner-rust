@@ -1,27 +1,21 @@
 use std::{
     fs,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
+        atomic::{AtomicU8, AtomicU64, Ordering},
     },
     thread, time,
 };
 
 use chrono::{SecondsFormat, Utc};
-use rand::RngCore;
+use rand::Rng;
 use rayon::prelude::*;
-use regex::Regex;
 
-use crate::{handler::handle_keypair, Args};
+use crate::{Args, handler::handle_keypair};
 
-pub fn run_cpu(
-    args: &Args,
-    regexes: &[String],
-    compiled_regexes: Vec<Regex>,
-    csv_file: &Option<Mutex<fs::File>>,
-) {
+pub fn run_cpu(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
     let generated = Arc::new(AtomicU64::new(0));
-    let max_leading_zeros: Vec<AtomicU8> = (0..(regexes.len())).map(|_| AtomicU8::new(0)).collect();
+    let max_leading_zeros: AtomicU8 = AtomicU8::new(0);
 
     let stats_thread = {
         let log_interval = args.log_interval;
@@ -47,7 +41,7 @@ pub fn run_cpu(
     };
 
     rayon::iter::repeat(()).for_each(|_| {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         for _ in 0..64 * 1024 {
             let mut seed = [0u8; 32];
@@ -56,14 +50,7 @@ pub fn run_cpu(
             let kp = ed25519_dalek::SigningKey::from_bytes(&seed);
             let binding = kp.verifying_key();
             let public = binding.as_bytes();
-            handle_keypair(
-                &seed,
-                public,
-                regexes,
-                &compiled_regexes,
-                &max_leading_zeros,
-                csv_file,
-            );
+            handle_keypair(&seed, public, &max_leading_zeros, args.highest, csv_file);
         }
 
         generated.fetch_add(64 * 1024, Ordering::AcqRel);

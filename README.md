@@ -15,16 +15,9 @@ cargo run --release
 ./yggdrasil-vanity
 ```
 
-## Regex matching
+## Address matching
 
-Pass -r "regex" argument (you can do it multiple times of you want search for multiple patterns) to search only for adresses matching given regex.
-
-Example:
-
-```shell
-./yggdrasil-vanity -r "" -r "^([0-9a-f]*:){2}:" -r "^([0-9a-f]*:){2}[0-9a-f]{0,2}:0:" -r "^([0-9a-f]*:){3}0:" -r "1234:5678"
-# or use cargo run --release -- -r "" ... if you want to build from source
-```
+To change which address will be searched ou will need to rewrite the matching part of the code! `src/handler.rs:22`
 
 ## Benchmarks
 
