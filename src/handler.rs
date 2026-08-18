@@ -55,7 +55,7 @@ pub fn handle_keypair(
                 let mut csv_file = csv_file.lock().unwrap();
                 writeln!(
                     csv_file,
-                    "{},{str_addr},{leading_zeros},{privkey_str}", // TODO: CSV stuff
+                    "{},{str_addr},{leading_zeros},{privkey_str}",
                     Utc::now().timestamp()
                 )
                 .unwrap();
