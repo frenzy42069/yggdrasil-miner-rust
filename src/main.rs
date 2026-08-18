@@ -12,7 +12,7 @@ mod handler;
 #[command(author, version, about, long_about = None)]
 pub struct Args {
     /// Search highest addresses
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short('H'), long, default_value_t = false)]
     highest: bool,
 
     /// Disable OpenCL
