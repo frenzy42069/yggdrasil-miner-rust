@@ -12,7 +12,7 @@ pub fn handle_keypair(
     pk: &[u8],
     max_leading_zeros: &AtomicU8,
     highest: bool,
-    csv_file: &Option<Mutex<fs::File>>,
+    csv_file: Option<&Mutex<fs::File>>,
 ) {
     let leading_zeros = leading_zeros_of_pubkey(pk);
     let mut str_addr = None;
@@ -45,16 +45,15 @@ pub fn handle_keypair(
             {
                 let mut lock = std::io::stdout().lock();
                 writeln!(lock, "=======================================").unwrap();
-                writeln!(lock, "PrivateKey: {privkey_str}",).unwrap();
-                writeln!(lock, "Address: {}", str_addr).unwrap();
-                writeln!(lock, "Height: {}", leading_zeros).unwrap();
+                writeln!(lock, "PrivateKey: {privkey_str}").unwrap();
+                writeln!(lock, "Address: {str_addr}").unwrap();
+                writeln!(lock, "Height: {leading_zeros}").unwrap();
                 writeln!(lock, "=======================================").unwrap();
             }
 
             if let Some(csv_file) = csv_file {
-                let mut csv_file = csv_file.lock().unwrap();
                 writeln!(
-                    csv_file,
+                    csv_file.lock().unwrap(),
                     "{},{str_addr},{leading_zeros},{privkey_str}",
                     Utc::now().timestamp()
                 )
@@ -65,10 +64,10 @@ pub fn handle_keypair(
 }
 
 fn leading_zeros_of_pubkey(pk: &[u8]) -> u8 {
-    let mut zeros = 0u8;
+    let mut zeros = 0;
     for b in pk {
         let z = b.leading_zeros();
-        zeros += z as u8;
+        zeros += u8::try_from(z).unwrap();
         if z != 8 {
             break;
         }
@@ -85,8 +84,8 @@ fn address_for_pubkey(pk: &[u8]) -> std::net::Ipv6Addr {
         .windows(2)
         .zip(buf[2..].iter_mut())
     {
-        *trg = src[0].wrapping_shl(((zeros + 1) % 8) as u32)
-            ^ src[1].wrapping_shr(8 - ((zeros + 1) % 8) as u32)
+        *trg = src[0].wrapping_shl(u32::from((zeros + 1) % 8))
+            ^ src[1].wrapping_shr(8 - u32::from((zeros + 1) % 8))
             ^ 0xFF;
     }
     std::net::Ipv6Addr::from(buf)
@@ -107,6 +106,6 @@ mod tests {
                     .as_slice()
             ),
             std::net::Ipv6Addr::from_str("224:7614:e3ec:5cd4:da1b:7ad5:c32a:b9cf").unwrap()
-        )
+        );
     }
 }

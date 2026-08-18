@@ -13,7 +13,7 @@ use rayon::prelude::*;
 
 use crate::{Args, handler::handle_keypair};
 
-pub fn run_cpu(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
+pub fn run_cpu(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
     let generated = Arc::new(AtomicU64::new(0));
     let max_leading_zeros: AtomicU8 = AtomicU8::new(0);
 
@@ -27,6 +27,7 @@ pub fn run_cpu(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
             loop {
                 thread::sleep(time::Duration::from_secs(log_interval));
 
+                #[allow(clippy::cast_precision_loss)]
                 let hashrate = generated.swap(0, Ordering::AcqRel) as f64
                     / start.elapsed().as_secs_f64()
                     / 1_000_000.0;
@@ -40,7 +41,7 @@ pub fn run_cpu(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
         })
     };
 
-    rayon::iter::repeat(()).for_each(|_| {
+    rayon::iter::repeat(()).for_each(|()| {
         let mut rng = rand::rng();
 
         for _ in 0..64 * 1024 {

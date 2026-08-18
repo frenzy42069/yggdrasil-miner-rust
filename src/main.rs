@@ -15,27 +15,27 @@ pub struct Args {
     #[arg(short('H'), long, default_value_t = false)]
     highest: bool,
 
-    /// Disable OpenCL
+    /// Disable `OpenCL`
     #[arg(short('c'), long, default_value_t = false)]
     disable_opencl: bool,
 
-    /// OpenCL thread count
+    /// `OpenCL` thread count
     #[arg(short, long, default_value_t = 1024 * 1024)]
     threads: usize,
 
-    /// OpenCL local work size
+    /// `OpenCL` local work size
     #[arg(short, long)]
     local_work_size: Option<usize>,
 
-    /// OpenCL global work size
+    /// `OpenCL` global work size
     #[arg(short, long)]
     global_work_size: Option<usize>,
 
-    /// OpenCL platform index
+    /// `OpenCL` platform index
     #[arg(short, long, default_value_t = 0)]
     platform_idx: usize,
 
-    /// OpenCL device index
+    /// `OpenCL` device index
     #[arg(short, long, default_value_t = 0)]
     device_idx: usize,
 
@@ -73,9 +73,9 @@ fn main_() {
         Mutex::new(f)
     });
 
-    if !args.disable_opencl {
-        run_opencl(&args, &csv_file)
+    if args.disable_opencl {
+        run_cpu(&args, csv_file.as_ref());
     } else {
-        run_cpu(&args, &csv_file)
+        run_opencl(&args, csv_file.as_ref());
     }
 }

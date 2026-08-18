@@ -37,7 +37,7 @@ struct Gpu {
 }
 
 impl Gpu {
-    pub fn new(opts: GpuOptions) -> Result<Gpu> {
+    pub fn new(opts: GpuOptions) -> Result<Self> {
         let mut prog_bldr = ProgramBuilder::new();
         prog_bldr
             .src(include_str!("../kernel/sha512.cl"))
@@ -92,37 +92,37 @@ impl Gpu {
             kernel_builder.build()?
         };
 
-        Ok(Gpu {
+        Ok(Self {
             kernel,
             results,
             keys,
         })
     }
 
-    pub fn compute(&mut self) -> Result<()> {
+    pub fn compute(&self) -> Result<()> {
         unsafe {
             self.kernel.enq()?;
         }
         Ok(())
     }
 
-    pub fn read_keys(&mut self, results: &mut [u8]) -> Result<()> {
+    pub fn read_keys(&self, results: &mut [u8]) -> Result<()> {
         self.results.read(results).enq()?;
         Ok(())
     }
 
-    pub fn write_seeds(&mut self, keys: &[u8]) -> Result<()> {
+    pub fn write_seeds(&self, keys: &[u8]) -> Result<()> {
         self.keys.write(keys).enq()?;
         Ok(())
     }
 }
 
-pub fn run_opencl(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
+pub fn run_opencl(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
     let pubkeys = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
     let next_seeds = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
     let current_seeds = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
 
-    let mut gpu = Gpu::new(GpuOptions {
+    let gpu = Gpu::new(GpuOptions {
         platform_idx: args.platform_idx,
         device_idx: args.device_idx,
         threads: args.threads,
@@ -188,6 +188,7 @@ pub fn run_opencl(args: &Args, csv_file: &Option<Mutex<fs::File>>) {
         iters += args.threads as u64;
         let elapsed = start.elapsed();
         if !first_run && elapsed.as_secs() >= args.log_interval {
+            #[allow(clippy::cast_precision_loss)]
             let hashrate = iters as f64 / elapsed.as_secs_f64() / 1_000_000.0;
             eprintln!(
                 "{} Hashrate: {:.2} MH/s",
@@ -208,7 +209,7 @@ fn handle_keypairs(
     pubkeys: &[u8],
     max_leading_zeros: &AtomicU8,
     highest: bool,
-    csv_file: &Option<Mutex<fs::File>>,
+    csv_file: Option<&Mutex<fs::File>>,
 ) {
     pubkeys
         .par_chunks_exact(32)
@@ -219,5 +220,5 @@ fn handle_keypairs(
 fn gen_random_seeds(seeds: &mut [u8]) {
     seeds.par_chunks_exact_mut(128 * 1024).for_each(|seed| {
         rand::rng().fill_bytes(seed);
-    })
+    });
 }
