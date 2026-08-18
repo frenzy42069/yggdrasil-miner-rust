@@ -21,8 +21,9 @@ To change which address will be searched ou will need to rewrite the matching pa
 
 ## Benchmarks
 
-- AMD Radeon RX 6800 XT: 25 MH/s
-- Intel Iris Xe TGL GT2 (integrated in i5-1135G7): 0.67 MH/s
+- Amd Radeon RX 550: 0.52 MH/s
+- AMD Radeon RX 6800 XT: 25 MH/s (likely outdated)
+- Intel Iris Xe TGL GT2 (integrated in i5-1135G7): 0.67 MH/s (likely outdated)
 
 Feel free to add your results and report hardware-specific issues!
 
