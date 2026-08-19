@@ -155,7 +155,8 @@ pub fn run_opencl(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
         })
     };
 
-    let max_leading_zeros: AtomicU8 = AtomicU8::new(0);
+    let highest: AtomicU8 = AtomicU8::new(0);
+    let shortest: AtomicU8 = AtomicU8::new(u8::MAX);
     let mut first_run = true;
 
     gen_random_seeds(&mut next_seeds.lock().unwrap());
@@ -171,8 +172,10 @@ pub fn run_opencl(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
             handle_keypairs(
                 &current_seeds.lock().unwrap(),
                 &pubkeys.lock().unwrap(),
-                &max_leading_zeros,
+                &highest,
+                &shortest,
                 args.highest,
+                args.shortest,
                 csv_file,
             );
         }
@@ -207,14 +210,18 @@ pub fn run_opencl(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
 fn handle_keypairs(
     seeds: &[u8],
     pubkeys: &[u8],
-    max_leading_zeros: &AtomicU8,
+    most_high: &AtomicU8,
+    most_short: &AtomicU8,
     highest: bool,
+    shortest: bool,
     csv_file: Option<&Mutex<fs::File>>,
 ) {
     pubkeys
         .par_chunks_exact(32)
         .zip(seeds.par_chunks_exact(32))
-        .for_each(|(pk, seed)| handle_keypair(seed, pk, max_leading_zeros, highest, csv_file));
+        .for_each(|(pk, seed)| {
+            handle_keypair(seed, pk, most_high, most_short, highest, shortest, csv_file);
+        });
 }
 
 fn gen_random_seeds(seeds: &mut [u8]) {

@@ -11,12 +11,24 @@ mod handler;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 pub struct Args {
-    /// Search highest addresses
-    #[arg(short('H'), long, default_value_t = false)]
+    /// Shortest address search
+    #[arg(short, long)]
+    shortest: bool,
+
+    /// Highest address search
+    #[arg(short('H'), long)]
     highest: bool,
 
+    /// CSV file to write results to
+    #[arg(short('f'), long)]
+    csv_file: Option<String>,
+
+    /// Log hashrate every N seconds
+    #[arg(short('i'), long, default_value_t = 10)]
+    log_interval: u64,
+
     /// Disable `OpenCL`
-    #[arg(short('c'), long, default_value_t = false)]
+    #[arg(short('c'), long)]
     disable_opencl: bool,
 
     /// `OpenCL` thread count
@@ -38,14 +50,6 @@ pub struct Args {
     /// `OpenCL` device index
     #[arg(short, long, default_value_t = 0)]
     device_idx: usize,
-
-    /// Log hashrate every N seconds
-    #[arg(short('i'), long, default_value_t = 10)]
-    log_interval: u64,
-
-    /// CSV file to write results to
-    #[arg(short('f'), long)]
-    csv_file: Option<String>,
 }
 
 fn main() {

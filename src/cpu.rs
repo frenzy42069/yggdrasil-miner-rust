@@ -15,7 +15,8 @@ use crate::{Args, handler::handle_keypair};
 
 pub fn run_cpu(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
     let generated = Arc::new(AtomicU64::new(0));
-    let max_leading_zeros: AtomicU8 = AtomicU8::new(0);
+    let highest: AtomicU8 = AtomicU8::new(0);
+    let shortest: AtomicU8 = AtomicU8::new(u8::MAX);
 
     let stats_thread = {
         let log_interval = args.log_interval;
@@ -51,7 +52,15 @@ pub fn run_cpu(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
             let kp = ed25519_dalek::SigningKey::from_bytes(&seed);
             let binding = kp.verifying_key();
             let public = binding.as_bytes();
-            handle_keypair(&seed, public, &max_leading_zeros, args.highest, csv_file);
+            handle_keypair(
+                &seed,
+                public,
+                &highest,
+                &shortest,
+                args.highest,
+                args.shortest,
+                csv_file,
+            );
         }
 
         generated.fetch_add(64 * 1024, Ordering::AcqRel);

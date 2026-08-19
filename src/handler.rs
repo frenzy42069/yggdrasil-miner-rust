@@ -10,25 +10,25 @@ use std::sync::atomic::{AtomicU8, Ordering};
 pub fn handle_keypair(
     seed: &[u8],
     pk: &[u8],
-    max_leading_zeros: &AtomicU8,
+    most_high: &AtomicU8,
+    most_short: &AtomicU8,
     highest: bool,
+    shortest: bool,
     csv_file: Option<&Mutex<fs::File>>,
 ) {
-    let leading_zeros = leading_zeros_of_pubkey(pk);
-    let mut str_addr = None;
+    let height = height_of_pubkey(pk);
 
-    if !highest || max_leading_zeros.load(Ordering::Relaxed) < leading_zeros {
+    if !highest || most_high.load(Ordering::Relaxed) < height {
         let addr = address_for_pubkey(pk);
+        let str_addr = addr.to_string();
+        #[allow(clippy::cast_possible_truncation)]
+        let length = str_addr.len() as u8;
 
         if let segs = addr.segments()
-            && segs.contains(&0x1337)
             && segs.contains(&0x0)
-            && segs.contains(&0x0ace)
-            && (!highest
-                || max_leading_zeros.fetch_max(leading_zeros, Ordering::SeqCst) < leading_zeros)
+            && (!highest || most_high.fetch_max(height, Ordering::SeqCst) < height)
+            && (!shortest || most_short.fetch_min(length, Ordering::SeqCst) >= length)
         {
-            let str_addr = str_addr.get_or_insert_with(|| addr.to_string());
-
             {
                 let mut fixed_seed = [0; 32];
                 fixed_seed.copy_from_slice(seed);
@@ -47,14 +47,17 @@ pub fn handle_keypair(
                 writeln!(lock, "=======================================").unwrap();
                 writeln!(lock, "PrivateKey: {privkey_str}").unwrap();
                 writeln!(lock, "Address: {str_addr}").unwrap();
-                writeln!(lock, "Height: {leading_zeros}").unwrap();
+                writeln!(lock, "Height: {height}").unwrap();
+                if shortest {
+                    writeln!(lock, "Size: {length}").unwrap();
+                }
                 writeln!(lock, "=======================================").unwrap();
             }
 
             if let Some(csv_file) = csv_file {
                 writeln!(
                     csv_file.lock().unwrap(),
-                    "{},{str_addr},{leading_zeros},{privkey_str}",
+                    "{},{str_addr},{height},{privkey_str}",
                     Utc::now().timestamp()
                 )
                 .unwrap();
@@ -63,7 +66,8 @@ pub fn handle_keypair(
     }
 }
 
-fn leading_zeros_of_pubkey(pk: &[u8]) -> u8 {
+/// Height is a number of leading zeroes of a public key
+fn height_of_pubkey(pk: &[u8]) -> u8 {
     let mut zeros = 0;
     for b in pk {
         let z = b.leading_zeros();
@@ -76,7 +80,7 @@ fn leading_zeros_of_pubkey(pk: &[u8]) -> u8 {
 }
 
 fn address_for_pubkey(pk: &[u8]) -> std::net::Ipv6Addr {
-    let zeros = leading_zeros_of_pubkey(pk);
+    let zeros = height_of_pubkey(pk);
     let mut buf = [0u8; 16];
     buf[0] = 0x02;
     buf[1] = zeros;
