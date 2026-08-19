@@ -1,10 +1,8 @@
 use std::{fs, io::Write, sync::Mutex};
 
 use clap::Parser;
-use cpu::run_cpu;
 use gpu::run_opencl;
 
-mod cpu;
 mod gpu;
 mod handler;
 
@@ -26,10 +24,6 @@ pub struct Args {
     /// Log hashrate every N seconds
     #[arg(short('i'), long, default_value_t = 10)]
     log_interval: u64,
-
-    /// Disable `OpenCL`
-    #[arg(short('c'), long)]
-    disable_opencl: bool,
 
     /// `OpenCL` thread count
     #[arg(short, long, default_value_t = 1024 * 1024)]
@@ -77,9 +71,5 @@ fn main_() {
         Mutex::new(f)
     });
 
-    if args.disable_opencl {
-        run_cpu(&args, csv_file.as_ref());
-    } else {
-        run_opencl(&args, csv_file.as_ref());
-    }
+    run_opencl(&args, csv_file.as_ref());
 }

@@ -1,18 +1,20 @@
-# Yggdrasil Vanity
+# Yggdrasil Miner
 
-Vanity address generator for the Yggdrasil network.
+Address miner for the Yggdrasil network
+
+Supports mining for high and/or short addresses
 
 ## Binary builds
 
-You can download binary builds for Windows and Linux in the [releases](https://github.com/averyanalex/yggdrasil-vanity/releases).
+You can download binary builds for Linux in the [releases](https://codeberg.org/Acemany/yggdrasil-miner/releases).
 
 ## Basic usage (just search high addresses)
 
 ```shell
 # build and run from source
-cargo run --release
+cargo run --release -- -H
 # or download and run
-./yggdrasil-vanity
+./yggdrasil-miner -H
 ```
 
 ## Address matching

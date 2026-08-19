@@ -1,11 +1,11 @@
 [package]
-name = "yggdrasil-vanity"
-version = "0.1.0"
+name = "yggdrasil-miner"
+version = "0.1.1"
 edition = "2024"
-description = "Vanity address generator for the Yggdrasil network"
+description = "Address miner for the Yggdrasil network"
 authors = ["Alexander Averyanov <alex@averyan.ru>"]
 readme = "README.md"
-repository = "https://github.com/averyanalex/yggdrasil-vanity"
+repository = "https://codeberg.org/Acemany/yggdrasil-miner"
 license = "BSD-2-Clause"
 
 [profile.release]
