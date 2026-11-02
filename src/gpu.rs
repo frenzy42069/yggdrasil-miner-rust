@@ -5,14 +5,16 @@ use chrono::SecondsFormat;
 use chrono::Utc;
 use ed25519_dalek::SigningKey;
 use ocl::builders::{DeviceSpecifier, ProgramBuilder};
+use ocl::enums::{KernelWorkGroupInfo, KernelWorkGroupInfoResult};
 use ocl::flags::MemFlags;
-use ocl::{Buffer, Kernel, Platform, ProQue, Result};
+use ocl::{Buffer, Device, Kernel, Platform, ProQue, Result};
 use rand::Rng;
 use rayon::prelude::*;
 
 use crate::Args;
 use crate::handler::{RecordFiles, Records, SearchConfig, handle_keypair, height_of_pubkey};
 use crate::table::{generate as generate_table, window_count};
+use crate::thermal::{Guard, Monitor};
 
 const BATCH: usize = 64;
 const HIT_CAPACITY: usize = 1 << 20;
@@ -27,6 +29,9 @@ const F_COLON_REQUIRED: i32 = 16;
 const TARGET_BATCH_SECONDS: f64 = 0.25;
 const MIN_WORK_ITEMS: usize = 64;
 const MAX_WORK_ITEMS: usize = 1 << 20;
+
+const THROTTLE_PERIOD: Duration = Duration::from_secs(15);
+const MIN_BURST: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy, Default)]
 struct GpuFilter {
@@ -83,6 +88,7 @@ struct Gpu {
     hits: Buffer<u32>,
     hit_count: Buffer<u32>,
     local_work_size: Option<usize>,
+    device_name: String,
 }
 
 impl Gpu {
@@ -157,13 +163,18 @@ impl Gpu {
             .arg(&hit_count)
             .arg(&(HIT_CAPACITY as u32));
         let kernel = kb.build()?;
+        let local_work_size = match args.local_work_size {
+            Some(local) => local,
+            None => preferred_local_size(&kernel, pq.device())?,
+        };
 
         Ok(Self {
             kernel,
             table,
             hits,
             hit_count,
-            local_work_size: args.local_work_size,
+            local_work_size: Some(local_work_size),
+            device_name: pq.device().name()?,
         })
     }
 
@@ -212,6 +223,20 @@ impl Gpu {
     }
 }
 
+/// The hardware's own group size: smaller groups waste lanes, larger ones can fail
+/// with `OUT_OF_RESOURCES` because every work item holds BATCH keys in private memory.
+fn preferred_local_size(kernel: &Kernel, device: Device) -> Result<usize> {
+    let preferred = kernel.wg_info(device, KernelWorkGroupInfo::PreferredWorkGroupSizeMultiple)?;
+    let maximum = kernel.wg_info(device, KernelWorkGroupInfo::WorkGroupSize)?;
+    match (preferred, maximum) {
+        (
+            KernelWorkGroupInfoResult::PreferredWorkGroupSizeMultiple(preferred),
+            KernelWorkGroupInfoResult::WorkGroupSize(maximum),
+        ) => Ok(preferred.min(maximum).max(1)),
+        _ => Err("unexpected work group info".into()),
+    }
+}
+
 fn seed_for(base: &[u64; 4], id: u64) -> [u8; 32] {
     let words = [base[0] ^ id, base[1], base[2], base[3]];
     let mut seed = [0u8; 32];
@@ -252,6 +277,41 @@ fn align_work_items(work_items: usize, local: Option<usize>) -> usize {
     }
 }
 
+/// Holds the GPU at `throttle` percent of the time with long bursts of batches and
+/// long rests.  Measured on an RTX 3070 Laptop: during short rests the GPU stays in
+/// its high power state, and after longer ones it needs about a second to clock back
+/// up, so rapid on/off cycling loses speed and saves little power.
+struct Pacer {
+    throttle: u32,
+    burst: Duration,
+    busy: Duration,
+}
+
+impl Pacer {
+    fn new(throttle: u8) -> Self {
+        let throttle = u32::from(throttle.clamp(1, 100));
+        Self {
+            throttle,
+            burst: (THROTTLE_PERIOD * throttle / 100).max(MIN_BURST),
+            busy: Duration::ZERO,
+        }
+    }
+
+    /// How long to rest after a batch, if the current burst is over.
+    fn rest_after(&mut self, elapsed: Duration) -> Option<Duration> {
+        if self.throttle == 100 {
+            return None;
+        }
+        self.busy += elapsed;
+        if self.busy < self.burst {
+            return None;
+        }
+        let rest = self.busy * (100 - self.throttle) / self.throttle;
+        self.busy = Duration::ZERO;
+        Some(rest)
+    }
+}
+
 pub fn run_opencl(args: &Args, records: &Records, files: &RecordFiles, cfg: SearchConfig) {
     let gpu = Gpu::new(args).unwrap();
 
@@ -267,21 +327,47 @@ pub fn run_opencl(args: &Args, records: &Records, files: &RecordFiles, cfg: Sear
     // Seed the thresholds with a real batch first.  Without this the initial
     // "everything is a new record" thresholds would make the GPU report every
     // key in the first filtered batch.
-    let warmup_items = WARMUP_KEYS.div_ceil(BATCH);
+    let warmup_items = align_work_items(WARMUP_KEYS.div_ceil(BATCH), gpu.local_work_size);
     gpu.enqueue(warmup_items, &base, 0, GpuFilter::force_all())
         .unwrap();
     let warmup_hits = gpu.take_hits().unwrap();
     handle_hits(&warmup_hits, &base, 0, records, files, &cfg);
 
     let mut first_id = (warmup_items * BATCH) as u64;
-    let mut work_items = align_work_items(initial_work_items(args), args.local_work_size);
+    let mut work_items = align_work_items(initial_work_items(args), gpu.local_work_size);
     let fixed_work_items = args.global_work_size.is_some();
 
     let mut start = Instant::now();
     let mut iters = 0u64;
     let mut first = true;
+    let mut pacer = Pacer::new(args.throttle);
+    let mut woke_up = false;
+
+    let monitor = (args.temp_limit > 0).then(|| Monitor::start(gpu.device_name.clone()));
+    if monitor.as_ref().is_some_and(|m| m.temperature().is_none()) {
+        eprintln!("GPU temperature is not available, --temp-limit has no effect");
+    }
+    let mut guard = Guard::new(args.temp_limit);
 
     loop {
+        let temperature = monitor.as_ref().and_then(Monitor::temperature);
+        let was_cooling = guard.cooling();
+        if guard.must_wait(temperature) {
+            if !was_cooling {
+                eprintln!(
+                    "GPU at {} C, pausing until it is below {} C",
+                    temperature.unwrap_or_default(),
+                    guard.resume_at()
+                );
+            }
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        if was_cooling {
+            eprintln!("GPU cooled down, resuming");
+            woke_up = true;
+        }
+
         let filter = GpuFilter::for_records(records, &cfg);
         let work_items_now = align_work_items(work_items, gpu.local_work_size);
 
@@ -297,7 +383,9 @@ pub fn run_opencl(args: &Args, records: &Records, files: &RecordFiles, cfg: Sear
         first_id += tried;
         iters += tried;
 
-        if !fixed_work_items {
+        // A batch right after a sleep runs on low clocks.  Shrinking the next one
+        // because of it would keep the GPU from ever clocking back up.
+        if !fixed_work_items && !woke_up {
             if elapsed.as_secs_f64() < TARGET_BATCH_SECONDS * 0.6 {
                 work_items = (work_items * 2).min(MAX_WORK_ITEMS);
             } else if elapsed.as_secs_f64() > TARGET_BATCH_SECONDS * 1.6 {
@@ -305,8 +393,16 @@ pub fn run_opencl(args: &Args, records: &Records, files: &RecordFiles, cfg: Sear
             }
         }
 
+        let rest = pacer.rest_after(elapsed);
+        if let Some(rest) = rest {
+            std::thread::sleep(rest);
+        }
+        woke_up = rest.is_some();
+
+        // While throttling, report whole burst + rest cycles so the rate is not
+        // skewed by where the interval happens to end.
         let el = start.elapsed();
-        if !first && el.as_secs() >= args.log_interval {
+        if !first && el.as_secs() >= args.log_interval && (pacer.throttle == 100 || woke_up) {
             #[allow(clippy::cast_precision_loss)]
             let hr = iters as f64 / el.as_secs_f64() / 1e6;
             eprintln!(
@@ -318,17 +414,6 @@ pub fn run_opencl(args: &Args, records: &Records, files: &RecordFiles, cfg: Sear
             iters = 0;
         }
         first = false;
-
-        let throttle = u64::from(args.throttle.clamp(1, 100));
-        if throttle < 100 {
-            let elapsed_ms = elapsed.as_millis() as u64;
-            if elapsed_ms > 0 {
-                let sleep_ms = elapsed_ms * (100 - throttle) / throttle;
-                if sleep_ms > 0 {
-                    std::thread::sleep(Duration::from_millis(sleep_ms));
-                }
-            }
-        }
     }
 }
 
@@ -344,6 +429,48 @@ mod tests {
         0x8877_6655_4433_2211,
     ];
     const ALL_KEYS: usize = 65536;
+
+    fn cycle(pacer: &mut Pacer, batch: Duration) -> (Duration, Duration) {
+        let mut busy = Duration::ZERO;
+        loop {
+            busy += batch;
+            if let Some(rest) = pacer.rest_after(batch) {
+                return (busy, rest);
+            }
+        }
+    }
+
+    #[test]
+    fn full_speed_never_rests() {
+        let mut pacer = Pacer::new(100);
+        assert_eq!(pacer.rest_after(Duration::from_secs(60)), None);
+    }
+
+    #[test]
+    fn rest_keeps_the_requested_share() {
+        let batch = Duration::from_millis(250);
+        for (throttle, burst, rest) in [
+            (75, 11_250, 3_750),
+            (50, 7_500, 7_500),
+            (10, 3_000, 27_000), // short bursts would never reach full clocks
+        ] {
+            let mut pacer = Pacer::new(throttle);
+            for _ in 0..3 {
+                let (busy, slept) = cycle(&mut pacer, batch);
+                assert_eq!(busy, Duration::from_millis(burst), "throttle {throttle}");
+                assert_eq!(slept, Duration::from_millis(rest), "throttle {throttle}");
+            }
+        }
+    }
+
+    #[test]
+    fn slow_batches_count_towards_the_share() {
+        let mut pacer = Pacer::new(25);
+        assert_eq!(
+            pacer.rest_after(Duration::from_secs(8)),
+            Some(Duration::from_secs(24))
+        );
+    }
 
     fn compare(
         gpu: &Gpu,

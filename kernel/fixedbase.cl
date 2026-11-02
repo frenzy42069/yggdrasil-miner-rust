@@ -10,8 +10,6 @@
 // Built with -DWINDOW_BITS=<bits> -DWINDOWS=<count> -DBATCH=<keys per work item>.
 // Field arithmetic is the radix 2^25.5 representation from ref10.
 
-#pragma OPENCL EXTENSION cl_khr_int64 : enable
-
 typedef int fe[10];
 
 // Filter flags shared with src/gpu.rs.
@@ -20,6 +18,26 @@ typedef int fe[10];
 #define F_SHORTEST 4
 #define F_LOWEST 8
 #define F_COLON_REQUIRED 16
+
+static inline void fe_carry(__private int *h, long h0, long h1, long h2, long h3, long h4,
+                            long h5, long h6, long h7, long h8, long h9)
+{
+    long c;
+    c = (h0 + (1L << 25)) >> 26; h1 += c; h0 -= c << 26;
+    c = (h4 + (1L << 25)) >> 26; h5 += c; h4 -= c << 26;
+    c = (h1 + (1L << 24)) >> 25; h2 += c; h1 -= c << 25;
+    c = (h5 + (1L << 24)) >> 25; h6 += c; h5 -= c << 25;
+    c = (h2 + (1L << 25)) >> 26; h3 += c; h2 -= c << 26;
+    c = (h6 + (1L << 25)) >> 26; h7 += c; h6 -= c << 26;
+    c = (h3 + (1L << 24)) >> 25; h4 += c; h3 -= c << 25;
+    c = (h7 + (1L << 24)) >> 25; h8 += c; h7 -= c << 25;
+    c = (h4 + (1L << 25)) >> 26; h5 += c; h4 -= c << 26;
+    c = (h8 + (1L << 25)) >> 26; h9 += c; h8 -= c << 26;
+    c = (h9 + (1L << 24)) >> 25; h0 += c * 19; h9 -= c << 25;
+    c = (h0 + (1L << 25)) >> 26; h1 += c; h0 -= c << 26;
+    h[0] = (int)h0; h[1] = (int)h1; h[2] = (int)h2; h[3] = (int)h3; h[4] = (int)h4;
+    h[5] = (int)h5; h[6] = (int)h6; h[7] = (int)h7; h[8] = (int)h8; h[9] = (int)h9;
+}
 
 static inline void fe_mul(__private int *h, __private const int *f, __private const int *g)
 {
@@ -42,21 +60,29 @@ static inline void fe_mul(__private int *h, __private const int *f, __private co
     long h8 = M(f0, g8) + M(f1_2, g7) + M(f2, g6) + M(f3_2, g5) + M(f4, g4) + M(f5_2, g3) + M(f6, g2) + M(f7_2, g1) + M(f8, g0) + M(f9_2, g9_19);
     long h9 = M(f0, g9) + M(f1, g8) + M(f2, g7) + M(f3, g6) + M(f4, g5) + M(f5, g4) + M(f6, g3) + M(f7, g2) + M(f8, g1) + M(f9, g0);
 #undef M
-    long c;
-    c = (h0 + (1L << 25)) >> 26; h1 += c; h0 -= c << 26;
-    c = (h4 + (1L << 25)) >> 26; h5 += c; h4 -= c << 26;
-    c = (h1 + (1L << 24)) >> 25; h2 += c; h1 -= c << 25;
-    c = (h5 + (1L << 24)) >> 25; h6 += c; h5 -= c << 25;
-    c = (h2 + (1L << 25)) >> 26; h3 += c; h2 -= c << 26;
-    c = (h6 + (1L << 25)) >> 26; h7 += c; h6 -= c << 26;
-    c = (h3 + (1L << 24)) >> 25; h4 += c; h3 -= c << 25;
-    c = (h7 + (1L << 24)) >> 25; h8 += c; h7 -= c << 25;
-    c = (h4 + (1L << 25)) >> 26; h5 += c; h4 -= c << 26;
-    c = (h8 + (1L << 25)) >> 26; h9 += c; h8 -= c << 26;
-    c = (h9 + (1L << 24)) >> 25; h0 += c * 19; h9 -= c << 25;
-    c = (h0 + (1L << 25)) >> 26; h1 += c; h0 -= c << 26;
-    h[0] = (int)h0; h[1] = (int)h1; h[2] = (int)h2; h[3] = (int)h3; h[4] = (int)h4;
-    h[5] = (int)h5; h[6] = (int)h6; h[7] = (int)h7; h[8] = (int)h8; h[9] = (int)h9;
+    fe_carry(h, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9);
+}
+
+static inline void fe_sq(__private int *h, __private const int *f)
+{
+    int f0 = f[0], f1 = f[1], f2 = f[2], f3 = f[3], f4 = f[4];
+    int f5 = f[5], f6 = f[6], f7 = f[7], f8 = f[8], f9 = f[9];
+    int f0_2 = 2 * f0, f1_2 = 2 * f1, f2_2 = 2 * f2, f3_2 = 2 * f3, f4_2 = 2 * f4;
+    int f5_2 = 2 * f5, f6_2 = 2 * f6, f7_2 = 2 * f7;
+    int f5_38 = 38 * f5, f6_19 = 19 * f6, f7_38 = 38 * f7, f8_19 = 19 * f8, f9_38 = 38 * f9;
+#define M(a, b) ((long)(a) * (long)(b))
+    long h0 = M(f0, f0) + M(f1_2, f9_38) + M(f2_2, f8_19) + M(f3_2, f7_38) + M(f4_2, f6_19) + M(f5, f5_38);
+    long h1 = M(f0_2, f1) + M(f2, f9_38) + M(f3_2, f8_19) + M(f4, f7_38) + M(f5_2, f6_19);
+    long h2 = M(f0_2, f2) + M(f1_2, f1) + M(f3_2, f9_38) + M(f4_2, f8_19) + M(f5_2, f7_38) + M(f6, f6_19);
+    long h3 = M(f0_2, f3) + M(f1_2, f2) + M(f4, f9_38) + M(f5_2, f8_19) + M(f6, f7_38);
+    long h4 = M(f0_2, f4) + M(f1_2, f3_2) + M(f2, f2) + M(f5_2, f9_38) + M(f6_2, f8_19) + M(f7, f7_38);
+    long h5 = M(f0_2, f5) + M(f1_2, f4) + M(f2_2, f3) + M(f6, f9_38) + M(f7_2, f8_19);
+    long h6 = M(f0_2, f6) + M(f1_2, f5_2) + M(f2_2, f4) + M(f3_2, f3) + M(f7_2, f9_38) + M(f8, f8_19);
+    long h7 = M(f0_2, f7) + M(f1_2, f6) + M(f2_2, f5) + M(f3_2, f4) + M(f8, f9_38);
+    long h8 = M(f0_2, f8) + M(f1_2, f7_2) + M(f2_2, f6) + M(f3_2, f5_2) + M(f4, f4) + M(f9, f9_38);
+    long h9 = M(f0_2, f9) + M(f1_2, f8) + M(f2_2, f7) + M(f3_2, f6) + M(f4_2, f5);
+#undef M
+    fe_carry(h, h0, h1, h2, h3, h4, h5, h6, h7, h8, h9);
 }
 
 static inline void fe_copy(__private int *h, __private const int *f)
@@ -76,19 +102,19 @@ static inline void fe_sub(__private int *h, __private const int *f, __private co
 
 static inline void fe_sq_n(__private int *h, __private const int *f, int n)
 {
-    fe_mul(h, f, f);
-    for (int i = 1; i < n; i++) fe_mul(h, h, h);
+    fe_sq(h, f);
+    for (int i = 1; i < n; i++) fe_sq(h, h);
 }
 
-// z^(p-2). With batching this runs once per BATCH keys.
+// z^(p-2)
 static void fe_invert(__private int *out, __private const int *z)
 {
     fe t0, t1, t2, t3;
-    fe_mul(t0, z, z);
+    fe_sq(t0, z);
     fe_sq_n(t1, t0, 2);
     fe_mul(t1, z, t1);
     fe_mul(t0, t0, t1);
-    fe_mul(t2, t0, t0);
+    fe_sq(t2, t0);
     fe_mul(t1, t1, t2);
     fe_sq_n(t2, t1, 5);
     fe_mul(t1, t2, t1);
@@ -137,78 +163,208 @@ static inline ulong bswap64(ulong x)
     return (x << 32) | (x >> 32);
 }
 
-__constant ulong SHA512_K[80] = {
-    0x428a2f98d728ae22UL, 0x7137449123ef65cdUL, 0xb5c0fbcfec4d3b2fUL, 0xe9b5dba58189dbbcUL,
-    0x3956c25bf348b538UL, 0x59f111f1b605d019UL, 0x923f82a4af194f9bUL, 0xab1c5ed5da6d8118UL,
-    0xd807aa98a3030242UL, 0x12835b0145706fbeUL, 0x243185be4ee4b28cUL, 0x550c7dc3d5ffb4e2UL,
-    0x72be5d74f27b896fUL, 0x80deb1fe3b1696b1UL, 0x9bdc06a725c71235UL, 0xc19bf174cf692694UL,
-    0xe49b69c19ef14ad2UL, 0xefbe4786384f25e3UL, 0x0fc19dc68b8cd5b5UL, 0x240ca1cc77ac9c65UL,
-    0x2de92c6f592b0275UL, 0x4a7484aa6ea6e483UL, 0x5cb0a9dcbd41fbd4UL, 0x76f988da831153b5UL,
-    0x983e5152ee66dfabUL, 0xa831c66d2db43210UL, 0xb00327c898fb213fUL, 0xbf597fc7beef0ee4UL,
-    0xc6e00bf33da88fc2UL, 0xd5a79147930aa725UL, 0x06ca6351e003826fUL, 0x142929670a0e6e70UL,
-    0x27b70a8546d22ffcUL, 0x2e1b21385c26c926UL, 0x4d2c6dfc5ac42aedUL, 0x53380d139d95b3dfUL,
-    0x650a73548baf63deUL, 0x766a0abb3c77b2a8UL, 0x81c2c92e47edaee6UL, 0x92722c851482353bUL,
-    0xa2bfe8a14cf10364UL, 0xa81a664bbc423001UL, 0xc24b8b70d0f89791UL, 0xc76c51a30654be30UL,
-    0xd192e819d6ef5218UL, 0xd69906245565a910UL, 0xf40e35855771202aUL, 0x106aa07032bbd1b8UL,
-    0x19a4c116b8d2d0c8UL, 0x1e376c085141ab53UL, 0x2748774cdf8eeb99UL, 0x34b0bcb5e19b48a8UL,
-    0x391c0cb3c5c95a63UL, 0x4ed8aa4ae3418acbUL, 0x5b9cca4f7763e373UL, 0x682e6ff3d6b2b8a3UL,
-    0x748f82ee5defb2fcUL, 0x78a5636f43172f60UL, 0x84c87814a1f0ab72UL, 0x8cc702081a6439ecUL,
-    0x90befffa23631e28UL, 0xa4506cebde82bde9UL, 0xbef9a3f7b2c67915UL, 0xc67178f2e372532bUL,
-    0xca273eceea26619cUL, 0xd186b8c721c0c207UL, 0xeada7dd6cde0eb1eUL, 0xf57d4f7fee6ed178UL,
-    0x06f067aa72176fbaUL, 0x0a637dc5a2c898a6UL, 0x113f9804bef90daeUL, 0x1b710b35131c471bUL,
-    0x28db77f523047d84UL, 0x32caab7b40c72493UL, 0x3c9ebe0a15c9bebcUL, 0x431d67c49c100d4cUL,
-    0x4cc5d4becb3e42b6UL, 0x597f299cfc657e2aUL, 0x5fcb6fab3ad6faecUL, 0x6c44198c4a475817UL
-};
-
 #define ROR(x, n) rotate((ulong)(x), (ulong)(64 - (n)))
+#define SHA_ROUND(a, b, c, d, e, f, g, h, k, w) \
+    t = h + (ROR(e, 14) ^ ROR(e, 18) ^ ROR(e, 41)) + bitselect(g, f, e) + k + w; \
+    d += t; \
+    h = t + (ROR(a, 28) ^ ROR(a, 34) ^ ROR(a, 39)) + bitselect(a, b, a ^ c);
+#define SHA_NEXT(w, w1, w9, w14) \
+    w += (ROR(w1, 1) ^ ROR(w1, 8) ^ (w1 >> 7)) + w9 + (ROR(w14, 19) ^ ROR(w14, 61) ^ (w14 >> 6));
 
 // SHA-512 of a 32-byte seed; out is the first 32 digest bytes as little-endian words.
+// Unrolled so round constants are immediates and the zero message words fold away.
 static inline void sha512_seed(ulong s0, ulong s1, ulong s2, ulong s3, __private ulong *out)
 {
-    ulong w[16] = {s0, s1, s2, s3, 0x8000000000000000UL, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 256};
+    ulong w0 = s0, w1 = s1, w2 = s2, w3 = s3, w4 = 0x8000000000000000UL, w5 = 0, w6 = 0, w7 = 0;
+    ulong w8 = 0, w9 = 0, w10 = 0, w11 = 0, w12 = 0, w13 = 0, w14 = 0, w15 = 256;
     ulong a = 0x6a09e667f3bcc908UL, b = 0xbb67ae8584caa73bUL, c = 0x3c6ef372fe94f82bUL, d = 0xa54ff53a5f1d36f1UL;
-    ulong e = 0x510e527fade682d1UL, f = 0x9b05688c2b3e6c1fUL, g = 0x1f83d9abfb41bd6bUL, h = 0x5be0cd19137e2179UL;
-    for (int t = 0; t < 80; t++) {
-        ulong wt;
-        if (t < 16) {
-            wt = w[t];
-        } else {
-            ulong x = w[(t - 15) & 15], y = w[(t - 2) & 15];
-            wt = w[t & 15] + (ROR(x, 1) ^ ROR(x, 8) ^ (x >> 7)) + w[(t - 7) & 15] + (ROR(y, 19) ^ ROR(y, 61) ^ (y >> 6));
-            w[t & 15] = wt;
-        }
-        ulong t1 = h + (ROR(e, 14) ^ ROR(e, 18) ^ ROR(e, 41)) + ((e & f) ^ (~e & g)) + SHA512_K[t] + wt;
-        ulong t2 = (ROR(a, 28) ^ ROR(a, 34) ^ ROR(a, 39)) + ((a & b) ^ (a & c) ^ (b & c));
-        h = g; g = f; f = e; e = d + t1; d = c; c = b; b = a; a = t1 + t2;
-    }
+    ulong e = 0x510e527fade682d1UL, f = 0x9b05688c2b3e6c1fUL, g = 0x1f83d9abfb41bd6bUL, h = 0x5be0cd19137e2179UL, t;
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0x428a2f98d728ae22UL, w0)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0x7137449123ef65cdUL, w1)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0xb5c0fbcfec4d3b2fUL, w2)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0xe9b5dba58189dbbcUL, w3)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x3956c25bf348b538UL, w4)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x59f111f1b605d019UL, w5)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x923f82a4af194f9bUL, w6)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0xab1c5ed5da6d8118UL, w7)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0xd807aa98a3030242UL, w8)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0x12835b0145706fbeUL, w9)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0x243185be4ee4b28cUL, w10)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0x550c7dc3d5ffb4e2UL, w11)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x72be5d74f27b896fUL, w12)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x80deb1fe3b1696b1UL, w13)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x9bdc06a725c71235UL, w14)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0xc19bf174cf692694UL, w15)
+    SHA_NEXT(w0, w1, w9, w14)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0xe49b69c19ef14ad2UL, w0)
+    SHA_NEXT(w1, w2, w10, w15)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0xefbe4786384f25e3UL, w1)
+    SHA_NEXT(w2, w3, w11, w0)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0x0fc19dc68b8cd5b5UL, w2)
+    SHA_NEXT(w3, w4, w12, w1)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0x240ca1cc77ac9c65UL, w3)
+    SHA_NEXT(w4, w5, w13, w2)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x2de92c6f592b0275UL, w4)
+    SHA_NEXT(w5, w6, w14, w3)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x4a7484aa6ea6e483UL, w5)
+    SHA_NEXT(w6, w7, w15, w4)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x5cb0a9dcbd41fbd4UL, w6)
+    SHA_NEXT(w7, w8, w0, w5)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x76f988da831153b5UL, w7)
+    SHA_NEXT(w8, w9, w1, w6)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0x983e5152ee66dfabUL, w8)
+    SHA_NEXT(w9, w10, w2, w7)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0xa831c66d2db43210UL, w9)
+    SHA_NEXT(w10, w11, w3, w8)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0xb00327c898fb213fUL, w10)
+    SHA_NEXT(w11, w12, w4, w9)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0xbf597fc7beef0ee4UL, w11)
+    SHA_NEXT(w12, w13, w5, w10)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0xc6e00bf33da88fc2UL, w12)
+    SHA_NEXT(w13, w14, w6, w11)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0xd5a79147930aa725UL, w13)
+    SHA_NEXT(w14, w15, w7, w12)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x06ca6351e003826fUL, w14)
+    SHA_NEXT(w15, w0, w8, w13)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x142929670a0e6e70UL, w15)
+    SHA_NEXT(w0, w1, w9, w14)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0x27b70a8546d22ffcUL, w0)
+    SHA_NEXT(w1, w2, w10, w15)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0x2e1b21385c26c926UL, w1)
+    SHA_NEXT(w2, w3, w11, w0)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0x4d2c6dfc5ac42aedUL, w2)
+    SHA_NEXT(w3, w4, w12, w1)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0x53380d139d95b3dfUL, w3)
+    SHA_NEXT(w4, w5, w13, w2)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x650a73548baf63deUL, w4)
+    SHA_NEXT(w5, w6, w14, w3)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x766a0abb3c77b2a8UL, w5)
+    SHA_NEXT(w6, w7, w15, w4)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x81c2c92e47edaee6UL, w6)
+    SHA_NEXT(w7, w8, w0, w5)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x92722c851482353bUL, w7)
+    SHA_NEXT(w8, w9, w1, w6)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0xa2bfe8a14cf10364UL, w8)
+    SHA_NEXT(w9, w10, w2, w7)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0xa81a664bbc423001UL, w9)
+    SHA_NEXT(w10, w11, w3, w8)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0xc24b8b70d0f89791UL, w10)
+    SHA_NEXT(w11, w12, w4, w9)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0xc76c51a30654be30UL, w11)
+    SHA_NEXT(w12, w13, w5, w10)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0xd192e819d6ef5218UL, w12)
+    SHA_NEXT(w13, w14, w6, w11)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0xd69906245565a910UL, w13)
+    SHA_NEXT(w14, w15, w7, w12)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0xf40e35855771202aUL, w14)
+    SHA_NEXT(w15, w0, w8, w13)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x106aa07032bbd1b8UL, w15)
+    SHA_NEXT(w0, w1, w9, w14)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0x19a4c116b8d2d0c8UL, w0)
+    SHA_NEXT(w1, w2, w10, w15)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0x1e376c085141ab53UL, w1)
+    SHA_NEXT(w2, w3, w11, w0)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0x2748774cdf8eeb99UL, w2)
+    SHA_NEXT(w3, w4, w12, w1)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0x34b0bcb5e19b48a8UL, w3)
+    SHA_NEXT(w4, w5, w13, w2)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x391c0cb3c5c95a63UL, w4)
+    SHA_NEXT(w5, w6, w14, w3)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x4ed8aa4ae3418acbUL, w5)
+    SHA_NEXT(w6, w7, w15, w4)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x5b9cca4f7763e373UL, w6)
+    SHA_NEXT(w7, w8, w0, w5)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x682e6ff3d6b2b8a3UL, w7)
+    SHA_NEXT(w8, w9, w1, w6)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0x748f82ee5defb2fcUL, w8)
+    SHA_NEXT(w9, w10, w2, w7)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0x78a5636f43172f60UL, w9)
+    SHA_NEXT(w10, w11, w3, w8)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0x84c87814a1f0ab72UL, w10)
+    SHA_NEXT(w11, w12, w4, w9)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0x8cc702081a6439ecUL, w11)
+    SHA_NEXT(w12, w13, w5, w10)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x90befffa23631e28UL, w12)
+    SHA_NEXT(w13, w14, w6, w11)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0xa4506cebde82bde9UL, w13)
+    SHA_NEXT(w14, w15, w7, w12)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0xbef9a3f7b2c67915UL, w14)
+    SHA_NEXT(w15, w0, w8, w13)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0xc67178f2e372532bUL, w15)
+    SHA_NEXT(w0, w1, w9, w14)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0xca273eceea26619cUL, w0)
+    SHA_NEXT(w1, w2, w10, w15)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0xd186b8c721c0c207UL, w1)
+    SHA_NEXT(w2, w3, w11, w0)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0xeada7dd6cde0eb1eUL, w2)
+    SHA_NEXT(w3, w4, w12, w1)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0xf57d4f7fee6ed178UL, w3)
+    SHA_NEXT(w4, w5, w13, w2)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x06f067aa72176fbaUL, w4)
+    SHA_NEXT(w5, w6, w14, w3)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x0a637dc5a2c898a6UL, w5)
+    SHA_NEXT(w6, w7, w15, w4)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x113f9804bef90daeUL, w6)
+    SHA_NEXT(w7, w8, w0, w5)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x1b710b35131c471bUL, w7)
+    SHA_NEXT(w8, w9, w1, w6)
+    SHA_ROUND(a, b, c, d, e, f, g, h, 0x28db77f523047d84UL, w8)
+    SHA_NEXT(w9, w10, w2, w7)
+    SHA_ROUND(h, a, b, c, d, e, f, g, 0x32caab7b40c72493UL, w9)
+    SHA_NEXT(w10, w11, w3, w8)
+    SHA_ROUND(g, h, a, b, c, d, e, f, 0x3c9ebe0a15c9bebcUL, w10)
+    SHA_NEXT(w11, w12, w4, w9)
+    SHA_ROUND(f, g, h, a, b, c, d, e, 0x431d67c49c100d4cUL, w11)
+    SHA_NEXT(w12, w13, w5, w10)
+    SHA_ROUND(e, f, g, h, a, b, c, d, 0x4cc5d4becb3e42b6UL, w12)
+    SHA_NEXT(w13, w14, w6, w11)
+    SHA_ROUND(d, e, f, g, h, a, b, c, 0x597f299cfc657e2aUL, w13)
+    SHA_NEXT(w14, w15, w7, w12)
+    SHA_ROUND(c, d, e, f, g, h, a, b, 0x5fcb6fab3ad6faecUL, w14)
+    SHA_NEXT(w15, w0, w8, w13)
+    SHA_ROUND(b, c, d, e, f, g, h, a, 0x6c44198c4a475817UL, w15)
     out[0] = bswap64(a + 0x6a09e667f3bcc908UL);
     out[1] = bswap64(b + 0xbb67ae8584caa73bUL);
     out[2] = bswap64(c + 0x3c6ef372fe94f82bUL);
     out[3] = bswap64(d + 0xa54ff53a5f1d36f1UL);
 }
 
-// Y and Z of scalar * B; the affine Y is all the address depends on.
+static inline void load_entry(__global const int *table, __private const ulong *scalar, int window,
+                              __private int *q0, __private int *q1, __private int *q2)
+{
+    int bit = window * WINDOW_BITS, word = bit >> 6, shift = bit & 63;
+    ulong v = scalar[word] >> shift;
+    if (shift + WINDOW_BITS > 64 && word < 3) v |= scalar[word + 1] << (64 - shift);
+    v &= (1UL << WINDOW_BITS) - 1;
+
+    __global const int *entry = table + 30 * (((ulong)window << WINDOW_BITS) + v);
+    for (int i = 0; i < 10; i++) {
+        q0[i] = entry[i];
+        q1[i] = entry[i + 10];
+        q2[i] = entry[i + 20];
+    }
+}
+
+// Y and Z of scalar * B; the affine y is all the address depends on.
 static inline void scalar_base(__global const int *table, __private const ulong *scalar,
                                __private int *out_y, __private int *out_z)
 {
     fe x, y, z, t, a, b, c, d, e, f, g, h, q0, q1, q2;
-    for (int i = 0; i < 10; i++) x[i] = y[i] = z[i] = t[i] = 0;
-    y[0] = 1;
-    z[0] = 1;
 
-    for (int window = 0; window < WINDOWS; window++) {
-        int bit = window * WINDOW_BITS, word = bit >> 6, shift = bit & 63;
-        ulong v = scalar[word] >> shift;
-        if (shift + WINDOW_BITS > 64 && word < 3) v |= scalar[word + 1] << (64 - shift);
-        v &= (1UL << WINDOW_BITS) - 1;
+    // The first addition starts from the identity, where a = q1, b = q0, c = 0 and
+    // d = 2 leave one multiplication out of seven. Operand order matters: 19 * g
+    // must fit in an int, so the larger value h goes first.
+    load_entry(table, scalar, 0, q0, q1, q2);
+    fe_sub(e, q0, q1);
+    fe_add(h, q0, q1);
+    fe_mul(t, h, e);
+    fe_add(x, e, e);
+    fe_add(y, h, h);
+    for (int i = 1; i < 10; i++) z[i] = 0;
+    z[0] = 4;
 
-        __global const int *entry = table + 30 * (((ulong)window << WINDOW_BITS) + v);
-        for (int i = 0; i < 10; i++) {
-            q0[i] = entry[i];
-            q1[i] = entry[i + 10];
-            q2[i] = entry[i + 20];
-        }
-
+    for (int window = 1; window < WINDOWS; window++) {
+        load_entry(table, scalar, window, q0, q1, q2);
         fe_sub(a, y, x);
         fe_mul(a, a, q1);
         fe_add(b, y, x);
@@ -219,10 +375,13 @@ static inline void scalar_base(__global const int *table, __private const ulong 
         fe_sub(f, d, c);
         fe_add(g, d, c);
         fe_add(h, b, a);
-        fe_mul(x, e, f);
         fe_mul(y, g, h);
         fe_mul(z, f, g);
-        fe_mul(t, e, h);
+        // Only y and z of the final point are used.
+        if (window < WINDOWS - 1) {
+            fe_mul(x, e, f);
+            fe_mul(t, e, h);
+        }
     }
     fe_copy(out_y, y);
     fe_copy(out_z, z);

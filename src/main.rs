@@ -8,6 +8,7 @@ use gpu::run_opencl;
 mod gpu;
 mod handler;
 mod table;
+mod thermal;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -48,9 +49,13 @@ pub struct Args {
     #[arg(short = 'i', long, default_value_t = 10)]
     log_interval: u64,
 
-    /// Target GPU usage percentage (1-100)
+    /// Target GPU usage percentage (1-100), held by alternating work and rest over about 15 s
     #[arg(long, default_value_t = 100)]
     throttle: u8,
+
+    /// Pause at this GPU temperature in Celsius and resume 5 degrees below it (0 disables)
+    #[arg(long, default_value_t = 85)]
+    temp_limit: u8,
 
     /// Track top N results per category
     #[arg(long, default_value_t = 10)]
