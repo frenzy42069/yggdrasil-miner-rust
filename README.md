@@ -6,7 +6,10 @@ Supports mining for high and/or short addresses
 
 ## Binary builds
 
-You can download binary builds for Linux in the [releases](https://codeberg.org/Acemany/yggdrasil-miner/releases).
+Please build it yourself with 
+```shell
+cargo build --release
+```
 
 ## Basic usage (just search high addresses)
 
