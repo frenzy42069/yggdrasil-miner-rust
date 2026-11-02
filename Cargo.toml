@@ -26,3 +26,4 @@ nursery = "warn"
 pedantic = "warn"
 perf = "warn"
 suspicious = "warn"
+

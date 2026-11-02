@@ -1,231 +1,574 @@
-use std::fs;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU8;
-use std::sync::mpsc;
-use std::thread;
-use std::time;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use chrono::SecondsFormat;
 use chrono::Utc;
-use ocl::Buffer;
-use ocl::Platform;
-use ocl::ProQue;
-use ocl::Result;
-use ocl::builders::DeviceSpecifier;
-use ocl::builders::ProgramBuilder;
+use ed25519_dalek::SigningKey;
+use ocl::builders::{DeviceSpecifier, ProgramBuilder};
 use ocl::flags::MemFlags;
+use ocl::{Buffer, Kernel, Platform, ProQue, Result};
 use rand::Rng;
 use rayon::prelude::*;
 
 use crate::Args;
-use crate::handler::handle_keypair;
+use crate::handler::{RecordFiles, Records, SearchConfig, handle_keypair, height_of_pubkey};
+use crate::table::{generate as generate_table, window_count};
 
-#[derive(Clone, Copy)]
-struct GpuOptions {
-    pub platform_idx: usize,
-    pub device_idx: usize,
-    pub threads: usize,
-    pub local_work_size: Option<usize>,
-    pub global_work_size: Option<usize>,
+const BATCH: usize = 64;
+const HIT_CAPACITY: usize = 1 << 20;
+const WARMUP_KEYS: usize = 4096;
+
+const F_FORCE_ALL: i32 = 1;
+const F_HIGHEST: i32 = 2;
+const F_SHORTEST: i32 = 4;
+const F_LOWEST: i32 = 8;
+const F_COLON_REQUIRED: i32 = 16;
+
+const TARGET_BATCH_SECONDS: f64 = 0.25;
+const MIN_WORK_ITEMS: usize = 64;
+const MAX_WORK_ITEMS: usize = 1 << 20;
+
+#[derive(Clone, Copy, Default)]
+struct GpuFilter {
+    flags: i32,
+    min_height: i32,
+    max_length: i32,
+    lowest_packed: u64,
+}
+
+impl GpuFilter {
+    fn for_records(records: &Records, cfg: &SearchConfig) -> Self {
+        let packed = records.packed.load(Ordering::Relaxed);
+        let highest_idx = if cfg.colon { 3 } else { 1 };
+        let shortest_idx = if cfg.colon { 2 } else { 0 };
+        let lowest = if cfg.colon {
+            records.lowest_colon_packed.load(Ordering::Relaxed)
+        } else {
+            records.lowest_packed.load(Ordering::Relaxed)
+        };
+
+        let mut flags = 0;
+        if cfg.highest {
+            flags |= F_HIGHEST;
+        }
+        if cfg.shortest {
+            flags |= F_SHORTEST;
+        }
+        if cfg.lowest {
+            flags |= F_LOWEST;
+        }
+        if cfg.colon && !cfg.both_colon {
+            flags |= F_COLON_REQUIRED;
+        }
+
+        Self {
+            flags,
+            min_height: ((packed >> (highest_idx * 8)) & 0xFF) as i32,
+            max_length: ((packed >> (shortest_idx * 8)) & 0xFF) as i32,
+            lowest_packed: lowest,
+        }
+    }
+
+    fn force_all() -> Self {
+        Self {
+            flags: F_FORCE_ALL,
+            ..Self::default()
+        }
+    }
 }
 
 struct Gpu {
-    kernel: ocl::Kernel,
-    results: Buffer<u8>,
-    keys: Buffer<u8>,
+    kernel: Kernel,
+    table: Buffer<i32>,
+    hits: Buffer<u32>,
+    hit_count: Buffer<u32>,
+    local_work_size: Option<usize>,
 }
 
 impl Gpu {
-    pub fn new(opts: GpuOptions) -> Result<Self> {
-        let mut prog_bldr = ProgramBuilder::new();
-        prog_bldr
-            .src(include_str!("../kernel/sha512.cl"))
-            .src(include_str!("../kernel/curve25519-constants.cl"))
-            .src(include_str!("../kernel/curve25519-constants2.cl"))
-            .src(include_str!("../kernel/curve25519.cl"))
-            .src(include_str!("../kernel/entry.cl"));
+    fn new(args: &Args) -> Result<Self> {
+        let window_bits = args.window_bits;
+        let windows = window_count(window_bits);
+        let table_size = windows * (1 << window_bits) * 30 * 4;
+
+        eprintln!(
+            "Generating w{window_bits} table ({windows} windows, {:.1} MiB)...",
+            table_size as f64 / (1024.0 * 1024.0)
+        );
+        let started = Instant::now();
+        let table_values = generate_table(window_bits);
+        eprintln!(
+            "Table generated in {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
+
+        let mut program_builder = ProgramBuilder::new();
+        program_builder.src(include_str!("../kernel/fixedbase.cl"));
+        program_builder.cmplr_opt(format!(
+            "-DWINDOW_BITS={window_bits} -DWINDOWS={windows} -DBATCH={BATCH}"
+        ));
+
         let platforms = Platform::list();
         if platforms.is_empty() {
-            return Err("No OpenCL platforms exist (check your drivers and OpenCL setup)".into());
+            return Err("no OpenCL platforms".into());
         }
-        if opts.platform_idx >= platforms.len() {
-            return Err(format!(
-                "Platform index {} too large (max {})",
-                opts.platform_idx,
-                platforms.len() - 1
-            )
-            .into());
+        if args.platform_idx >= platforms.len() {
+            return Err("OpenCL platform index out of range".into());
         }
-        let pro_que = ProQue::builder()
-            .prog_bldr(prog_bldr)
-            .platform(platforms[opts.platform_idx])
-            .device(DeviceSpecifier::Indices(vec![opts.device_idx]))
-            .dims(32 * opts.threads)
-            .build()
-            .unwrap();
 
-        let device = pro_que.device();
-        eprintln!("Initializing GPU {} {}", device.vendor()?, device.name()?);
-
-        let results = pro_que
-            .buffer_builder::<u8>()
-            .flags(MemFlags::new().write_only().host_read_only())
+        let pq = ProQue::builder()
+            .prog_bldr(program_builder)
+            .platform(platforms[args.platform_idx])
+            .device(DeviceSpecifier::Indices(vec![args.device_idx]))
+            .dims(1)
             .build()?;
-        let keys = pro_que
-            .buffer_builder::<u8>()
+
+        eprintln!("GPU {} {}", pq.device().vendor()?, pq.device().name()?);
+
+        let table = pq
+            .buffer_builder::<i32>()
             .flags(MemFlags::new().read_only().host_write_only())
+            .len(table_values.len())
+            .copy_host_slice(&table_values)
+            .build()?;
+        let hits = pq
+            .buffer_builder::<u32>()
+            .flags(MemFlags::new().write_only().host_read_only())
+            .len(HIT_CAPACITY)
+            .build()?;
+        let hit_count = pq
+            .buffer_builder::<u32>()
+            .flags(MemFlags::new().read_write())
+            .len(1)
             .build()?;
 
-        let kernel = {
-            let mut kernel_builder = pro_que.kernel_builder("generate_pubkey");
-            kernel_builder
-                .global_work_size(opts.threads)
-                .arg(&results)
-                .arg(&keys);
-            if let Some(local_work_size) = opts.local_work_size {
-                kernel_builder.local_work_size(local_work_size);
-            }
-            if let Some(global_work_size) = opts.global_work_size {
-                kernel_builder.global_work_size(global_work_size);
-            }
-            kernel_builder.build()?
-        };
+        let mut kb = pq.kernel_builder("mine");
+        kb.arg(&table)
+            .arg(&0u64)
+            .arg(&0u64)
+            .arg(&0u64)
+            .arg(&0u64)
+            .arg(&0u64)
+            .arg(&0i32)
+            .arg(&0i32)
+            .arg(&0i32)
+            .arg(&0u64)
+            .arg(&hits)
+            .arg(&hit_count)
+            .arg(&(HIT_CAPACITY as u32));
+        let kernel = kb.build()?;
 
         Ok(Self {
             kernel,
-            results,
-            keys,
+            table,
+            hits,
+            hit_count,
+            local_work_size: args.local_work_size,
         })
     }
 
-    pub fn compute(&self) -> Result<()> {
+    fn enqueue(
+        &self,
+        work_items: usize,
+        base: &[u64; 4],
+        first_id: u64,
+        filter: GpuFilter,
+    ) -> Result<()> {
+        self.hit_count.write(&[0u32][..]).enq()?;
+        self.kernel.set_arg(0, &self.table)?;
+        self.kernel.set_arg(1, base[0])?;
+        self.kernel.set_arg(2, base[1])?;
+        self.kernel.set_arg(3, base[2])?;
+        self.kernel.set_arg(4, base[3])?;
+        self.kernel.set_arg(5, first_id)?;
+        self.kernel.set_arg(6, filter.flags)?;
+        self.kernel.set_arg(7, filter.min_height)?;
+        self.kernel.set_arg(8, filter.max_length)?;
+        self.kernel.set_arg(9, filter.lowest_packed)?;
+        self.kernel.set_arg(10, &self.hits)?;
+        self.kernel.set_arg(11, &self.hit_count)?;
+        self.kernel.set_arg(12, HIT_CAPACITY as u32)?;
+
+        let mut cmd = self.kernel.cmd();
+        cmd = cmd.global_work_size(work_items);
+        if let Some(local) = self.local_work_size {
+            cmd = cmd.local_work_size(local);
+        }
         unsafe {
-            self.kernel.enq()?;
+            cmd.enq()?;
         }
         Ok(())
     }
 
-    pub fn read_keys(&self, results: &mut [u8]) -> Result<()> {
-        self.results.read(results).enq()?;
-        Ok(())
-    }
-
-    pub fn write_seeds(&self, keys: &[u8]) -> Result<()> {
-        self.keys.write(keys).enq()?;
-        Ok(())
+    fn take_hits(&self) -> Result<Vec<u32>> {
+        let mut count = [0u32; 1];
+        self.hit_count.read(&mut count[..]).enq()?;
+        let found = (count[0] as usize).min(HIT_CAPACITY);
+        let mut ids = vec![0u32; found];
+        if found > 0 {
+            self.hits.read(&mut ids[..]).enq()?;
+        }
+        Ok(ids)
     }
 }
 
-pub fn run_opencl(args: &Args, csv_file: Option<&Mutex<fs::File>>) {
-    let pubkeys = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
-    let next_seeds = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
-    let current_seeds = Arc::new(Mutex::new(vec![0; 32 * args.threads]));
+fn seed_for(base: &[u64; 4], id: u64) -> [u8; 32] {
+    let words = [base[0] ^ id, base[1], base[2], base[3]];
+    let mut seed = [0u8; 32];
+    for (i, word) in words.iter().enumerate() {
+        seed[i * 8..i * 8 + 8].copy_from_slice(&word.to_be_bytes());
+    }
+    seed
+}
 
-    let gpu = Gpu::new(GpuOptions {
-        platform_idx: args.platform_idx,
-        device_idx: args.device_idx,
-        threads: args.threads,
-        local_work_size: args.local_work_size,
-        global_work_size: args.global_work_size,
-    })
-    .unwrap();
+fn handle_hits(
+    ids: &[u32],
+    base: &[u64; 4],
+    first_id: u64,
+    records: &Records,
+    files: &RecordFiles,
+    cfg: &SearchConfig,
+) {
+    ids.par_iter().for_each(|&offset| {
+        let seed = seed_for(base, first_id + u64::from(offset));
+        let signing_key = SigningKey::from_bytes(&seed);
+        let pubkey = signing_key.verifying_key().to_bytes();
+        let height = height_of_pubkey(&pubkey);
+        handle_keypair(&seed, &pubkey, height, records, files, cfg);
+    });
+}
 
-    let (start_write_compute_tx, start_write_compute_rx) = mpsc::channel::<()>();
-    let (seeds_wrote_tx, seeds_wrote_rx) = mpsc::channel::<()>();
-    let (start_keys_read_tx, start_keys_read_rx) = mpsc::channel::<()>();
-    let (keys_read_tx, pubkeys_read_rx) = mpsc::channel::<()>();
+fn initial_work_items(args: &Args) -> usize {
+    if let Some(global) = args.global_work_size {
+        return global.max(1);
+    }
+    (args.threads / BATCH).max(MIN_WORK_ITEMS)
+}
 
-    let _gpu_thread = {
-        let seeds = next_seeds.clone();
-        let pubkeys = pubkeys.clone();
-        thread::spawn(move || {
-            loop {
-                keys_read_tx.send(()).unwrap();
-                start_write_compute_rx.recv().unwrap();
+fn align_work_items(work_items: usize, local: Option<usize>) -> usize {
+    match local {
+        Some(local) if local > 1 => work_items.div_ceil(local) * local,
+        _ => work_items,
+    }
+}
 
-                gpu.write_seeds(&seeds.lock().unwrap()).unwrap();
-                seeds_wrote_tx.send(()).unwrap();
+pub fn run_opencl(args: &Args, records: &Records, files: &RecordFiles, cfg: SearchConfig) {
+    let gpu = Gpu::new(args).unwrap();
 
-                gpu.compute().unwrap();
+    let mut base_bytes = [0u8; 32];
+    rand::rng().fill_bytes(&mut base_bytes);
+    let base = [
+        u64::from_be_bytes(base_bytes[0..8].try_into().unwrap()),
+        u64::from_be_bytes(base_bytes[8..16].try_into().unwrap()),
+        u64::from_be_bytes(base_bytes[16..24].try_into().unwrap()),
+        u64::from_be_bytes(base_bytes[24..32].try_into().unwrap()),
+    ];
 
-                start_keys_read_rx.recv().unwrap();
-                gpu.read_keys(&mut pubkeys.lock().unwrap()).unwrap();
-            }
-        })
-    };
+    // Seed the thresholds with a real batch first.  Without this the initial
+    // "everything is a new record" thresholds would make the GPU report every
+    // key in the first filtered batch.
+    let warmup_items = WARMUP_KEYS.div_ceil(BATCH);
+    gpu.enqueue(warmup_items, &base, 0, GpuFilter::force_all())
+        .unwrap();
+    let warmup_hits = gpu.take_hits().unwrap();
+    handle_hits(&warmup_hits, &base, 0, records, files, &cfg);
 
-    let highest: AtomicU8 = AtomicU8::new(0);
-    let shortest: AtomicU8 = AtomicU8::new(u8::MAX);
-    let mut first_run = true;
+    let mut first_id = (warmup_items * BATCH) as u64;
+    let mut work_items = align_work_items(initial_work_items(args), args.local_work_size);
+    let fixed_work_items = args.global_work_size.is_some();
 
-    gen_random_seeds(&mut next_seeds.lock().unwrap());
-
-    let mut start = time::Instant::now();
+    let mut start = Instant::now();
     let mut iters = 0u64;
+    let mut first = true;
 
     loop {
-        start_write_compute_tx.send(()).unwrap();
+        let filter = GpuFilter::for_records(records, &cfg);
+        let work_items_now = align_work_items(work_items, gpu.local_work_size);
 
-        pubkeys_read_rx.recv().unwrap();
-        if !first_run {
-            handle_keypairs(
-                &current_seeds.lock().unwrap(),
-                &pubkeys.lock().unwrap(),
-                &highest,
-                &shortest,
-                args.highest,
-                args.shortest,
-                csv_file,
-            );
+        let batch_start = Instant::now();
+        gpu.enqueue(work_items_now, &base, first_id, filter)
+            .unwrap();
+        let hits = gpu.take_hits().unwrap();
+        let elapsed = batch_start.elapsed();
+
+        handle_hits(&hits, &base, first_id, records, files, &cfg);
+
+        let tried = (work_items_now * BATCH) as u64;
+        first_id += tried;
+        iters += tried;
+
+        if !fixed_work_items {
+            if elapsed.as_secs_f64() < TARGET_BATCH_SECONDS * 0.6 {
+                work_items = (work_items * 2).min(MAX_WORK_ITEMS);
+            } else if elapsed.as_secs_f64() > TARGET_BATCH_SECONDS * 1.6 {
+                work_items = (work_items / 2).max(MIN_WORK_ITEMS);
+            }
         }
-        start_keys_read_tx.send(()).unwrap();
 
-        gen_random_seeds(&mut current_seeds.lock().unwrap());
-        seeds_wrote_rx.recv().unwrap();
-        std::mem::swap(
-            &mut *current_seeds.lock().unwrap(),
-            &mut *next_seeds.lock().unwrap(),
-        );
-
-        iters += args.threads as u64;
-        let elapsed = start.elapsed();
-        if !first_run && elapsed.as_secs() >= args.log_interval {
+        let el = start.elapsed();
+        if !first && el.as_secs() >= args.log_interval {
             #[allow(clippy::cast_precision_loss)]
-            let hashrate = iters as f64 / elapsed.as_secs_f64() / 1_000_000.0;
+            let hr = iters as f64 / el.as_secs_f64() / 1e6;
             eprintln!(
                 "{} Hashrate: {:.2} MH/s",
                 Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true),
-                hashrate
+                hr
             );
-            start = time::Instant::now();
+            start = Instant::now();
             iters = 0;
         }
-        if first_run {
-            first_run = false;
+        first = false;
+
+        let throttle = u64::from(args.throttle.clamp(1, 100));
+        if throttle < 100 {
+            let elapsed_ms = elapsed.as_millis() as u64;
+            if elapsed_ms > 0 {
+                let sleep_ms = elapsed_ms * (100 - throttle) / throttle;
+                if sleep_ms > 0 {
+                    std::thread::sleep(Duration::from_millis(sleep_ms));
+                }
+            }
         }
     }
 }
 
-fn handle_keypairs(
-    seeds: &[u8],
-    pubkeys: &[u8],
-    most_high: &AtomicU8,
-    most_short: &AtomicU8,
-    highest: bool,
-    shortest: bool,
-    csv_file: Option<&Mutex<fs::File>>,
-) {
-    pubkeys
-        .par_chunks_exact(32)
-        .zip(seeds.par_chunks_exact(32))
-        .for_each(|(pk, seed)| {
-            handle_keypair(seed, pk, most_high, most_short, highest, shortest, csv_file);
-        });
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
 
-fn gen_random_seeds(seeds: &mut [u8]) {
-    seeds.par_chunks_exact_mut(128 * 1024).for_each(|seed| {
-        rand::rng().fill_bytes(seed);
-    });
+    const TEST_BASE: [u64; 4] = [
+        0x0123_4567_89ab_cdef,
+        0xfedc_ba98_7654_3210,
+        0x0f1e_2d3c_4b5a_6978,
+        0x8877_6655_4433_2211,
+    ];
+    const ALL_KEYS: usize = 65536;
+
+    fn compare(
+        gpu: &Gpu,
+        metrics: &[(u8, u8, usize, u64)],
+        keys: usize,
+        filter: GpuFilter,
+        expected: impl Fn(&(u8, u8, usize, u64)) -> bool,
+    ) {
+        assert_eq!(keys % BATCH, 0);
+        gpu.enqueue(keys / BATCH, &TEST_BASE, 0, filter).unwrap();
+        let mut got = gpu.take_hits().unwrap();
+        got.sort_unstable();
+
+        let want: Vec<u32> = (0..keys)
+            .filter(|&i| expected(&metrics[i]))
+            .map(|i| i as u32)
+            .collect();
+        assert!(
+            want.len() < HIT_CAPACITY,
+            "test case has too many hits: {}",
+            want.len()
+        );
+        assert_eq!(got, want, "GPU filter mismatch (flags={})", filter.flags);
+    }
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn gpu_filters_match_cpu() {
+        let args = Args::parse_from(["yggdrasil-miner", "--highest", "-w", "8"]);
+        let gpu = Gpu::new(&args).unwrap();
+
+        let metrics: Vec<(u8, u8, usize, u64)> = (0..ALL_KEYS)
+            .into_par_iter()
+            .map(|i| {
+                let seed = seed_for(&TEST_BASE, i as u64);
+                let pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+                crate::handler::metrics_for_test(&pk)
+            })
+            .collect();
+
+        compare(
+            &gpu,
+            &metrics,
+            ALL_KEYS,
+            GpuFilter {
+                flags: F_HIGHEST,
+                min_height: 8,
+                ..GpuFilter::default()
+            },
+            |m| i32::from(m.0) > 8,
+        );
+
+        compare(
+            &gpu,
+            &metrics,
+            ALL_KEYS,
+            GpuFilter {
+                flags: F_SHORTEST,
+                max_length: 37,
+                ..GpuFilter::default()
+            },
+            |m| m.1 < 37,
+        );
+
+        compare(
+            &gpu,
+            &metrics,
+            16384,
+            GpuFilter {
+                flags: F_LOWEST,
+                lowest_packed: 0x0100_1234_5678_9abc,
+                ..GpuFilter::default()
+            },
+            |m| m.3 < 0x0100_1234_5678_9abc,
+        );
+
+        compare(
+            &gpu,
+            &metrics,
+            ALL_KEYS,
+            GpuFilter {
+                flags: F_HIGHEST | F_COLON_REQUIRED,
+                min_height: 0,
+                ..GpuFilter::default()
+            },
+            |m| m.0 > 0 && m.2 >= 2,
+        );
+
+        compare(
+            &gpu,
+            &metrics,
+            ALL_KEYS,
+            GpuFilter {
+                flags: F_SHORTEST | F_COLON_REQUIRED,
+                max_length: 40,
+                ..GpuFilter::default()
+            },
+            |m| m.1 < 40 && m.2 >= 2,
+        );
+
+        let filter = GpuFilter {
+            flags: F_HIGHEST | F_SHORTEST | F_LOWEST,
+            min_height: 6,
+            max_length: 38,
+            lowest_packed: 0x0180_0000_0000_0000,
+        };
+        compare(&gpu, &metrics, 16384, filter, |m| {
+            m.0 > 6 || m.1 < 38 || m.3 < 0x0180_0000_0000_0000
+        });
+    }
+
+    const METRICS_SRC: &str = concat!(
+        include_str!("../kernel/fixedbase.cl"),
+        r#"
+__kernel void metrics(__global const int *table,
+                      ulong seed0, ulong seed1, ulong seed2, ulong seed3, ulong first_id,
+                      __global ulong *out)
+{
+    fe ys[BATCH], zs[BATCH], products[BATCH], inverse, z_inverse, affine_y;
+    ulong base = first_id + (ulong)get_global_id(0) * BATCH;
+
+    for (int i = 0; i < BATCH; i++) {
+        ulong scalar[4];
+        sha512_seed(seed0 ^ (base + i), seed1, seed2, seed3, scalar);
+        scalar[0] &= ~7UL;
+        scalar[3] = (scalar[3] & 0x3FFFFFFFFFFFFFFFUL) | 0x4000000000000000UL;
+        scalar_base(table, scalar, ys[i], zs[i]);
+        if (i) fe_mul(products[i], products[i - 1], zs[i]);
+        else fe_copy(products[0], zs[0]);
+    }
+
+    fe_invert(inverse, products[BATCH - 1]);
+
+    for (int i = BATCH - 1; i >= 0; i--) {
+        if (i) {
+            fe_mul(z_inverse, inverse, products[i - 1]);
+            fe_mul(inverse, inverse, zs[i]);
+        } else {
+            fe_copy(z_inverse, inverse);
+        }
+        fe_mul(affine_y, ys[i], z_inverse);
+
+        ulong words[3];
+        fe_low_words(affine_y, words);
+        ulong k0 = bswap64(words[0]), k1 = bswap64(words[1]), k2 = bswap64(words[2]);
+        int zeros = (int)clz(k0), keep = zeros + 1;
+        ulong a0 = ~(keep == 64 ? k1 : (k0 << keep) | (k1 >> (64 - keep)));
+        ulong a1 = ~(keep == 64 ? k2 : (k1 << keep) | (k2 >> (64 - keep)));
+        a1 &= 0xFFFFFFFFFFFF0000UL;
+
+        int length = 0, zero_run = 0;
+        address_metrics(a0, a1, &length, &zero_run);
+        ulong lv = ((ulong)zeros << 56) | (a0 >> 8);
+        __global ulong *o = out + (ulong)(base + i - first_id) * 2;
+        o[0] = (ulong)zeros | ((ulong)length << 8) | ((ulong)zero_run << 16);
+        o[1] = lv;
+    }
+}
+"#
+    );
+
+    #[test]
+    #[ignore = "requires a GPU"]
+    fn gpu_metrics_match_cpu() {
+        let args = Args::parse_from(["yggdrasil-miner", "--highest", "-w", "16"]);
+        let window_bits = args.window_bits;
+        let windows = window_count(window_bits);
+        let table_values = generate_table(window_bits);
+        let platforms = Platform::list();
+        let mut pb = ProgramBuilder::new();
+        pb.src(METRICS_SRC);
+        pb.cmplr_opt(format!(
+            "-DWINDOW_BITS={window_bits} -DWINDOWS={windows} -DBATCH={BATCH}"
+        ));
+        let pq = ProQue::builder()
+            .prog_bldr(pb)
+            .platform(platforms[args.platform_idx])
+            .device(DeviceSpecifier::Indices(vec![args.device_idx]))
+            .dims(1)
+            .build()
+            .unwrap();
+
+        let table = pq
+            .buffer_builder::<i32>()
+            .flags(MemFlags::new().read_only().host_write_only())
+            .len(table_values.len())
+            .copy_host_slice(&table_values)
+            .build()
+            .unwrap();
+        let out = pq
+            .buffer_builder::<u64>()
+            .flags(MemFlags::new().write_only().host_read_only())
+            .len(ALL_KEYS * 2)
+            .build()
+            .unwrap();
+
+        let mut kb = pq.kernel_builder("metrics");
+        kb.arg(&table)
+            .arg(&TEST_BASE[0])
+            .arg(&TEST_BASE[1])
+            .arg(&TEST_BASE[2])
+            .arg(&TEST_BASE[3])
+            .arg(&0u64)
+            .arg(&out);
+        let kernel = kb.build().unwrap();
+
+        let mut cmd = kernel.cmd();
+        cmd = cmd.global_work_size(ALL_KEYS / BATCH);
+        unsafe { cmd.enq().unwrap() };
+        let mut actual = vec![0u64; ALL_KEYS * 2];
+        out.read(&mut actual[..]).enq().unwrap();
+
+        for i in 0..ALL_KEYS {
+            let seed = seed_for(&TEST_BASE, i as u64);
+            let pk = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
+            let (height, length, run, lv) = crate::handler::metrics_for_test(&pk);
+            let expected_word = u64::from(height)
+                | (u64::from(length) << 8)
+                | ((run as u64) << 16);
+            assert_eq!(
+                actual[i * 2],
+                expected_word,
+                "metric mismatch at key {i}: height={height} length={length} run={run}"
+            );
+            assert_eq!(actual[i * 2 + 1], lv, "lowest key mismatch at key {i}");
+        }
+    }
 }
